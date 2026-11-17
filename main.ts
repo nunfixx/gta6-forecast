@@ -1,7 +1,8 @@
 // gta6-twitch-ccu-forecast-01: forecast GTA VI's launch-day Twitch viewers, hour by hour.
 //
-// The model, fitted at run time from the case file's own comparables (past big launches'
-// hourly SullyGnome counts, 14 days before to 3 days after their release day):
+// v2 (18 Nov 2026, tuning round 2). The model, fitted at run time from the case
+// file's own comparables (past big launches' hourly SullyGnome counts, 14 days
+// before to 3 days after their release day):
 //
 //   For each hour h = 2..24, the log-ratio ln(viewers_h / viewers_1) is regressed on the
 //   launch's own scale, ln(viewers_1), with a quadratic term:
@@ -11,22 +12,35 @@
 //   The scale is the whole story. Small launches (hour 1 in the hundreds) grow 10-100x
 //   through the day as regions unlock; the biggest launches (hour 1 near a million) are
 //   already at their peak and stay flat or fade. The quadratic term is what lets the
-//   curve saturate at the top end instead of extrapolating a straight line off a cliff:
-//   on leave-one-out validation over 42 launch curves it cuts the loss from 0.42 (linear
-//   in ln v_1) to 0.38, and on the biggest launches (ELDEN RING, Cyberpunk 2077) from
-//   ~0.42 to ~0.15-0.18.
+//   curve saturate at the top end instead of extrapolating a straight line off a cliff.
 //
-//   Spreads are honest, not assumed: the residuals of each hour's regression are
-//   median-centred and their empirical quantiles at the case's levels become the
-//   forecast's quantiles, so the width of every hour's band is the width the past
-//   launches actually showed at that hour. The median curve and the quantile offsets
-//   are lightly smoothed across neighbouring hours (3-point moving average).
+//   Three changes vs v1 (each validated on practice p00-p03 AND leave-one-out over
+//   all 41 launch curves; v1 practice 0.2174 / LOO 0.3772 -> v2 0.2043 / 0.3677,
+//   big-launch LOO 0.1690 -> 0.1352, and the gain holds in 25/30 bootstrap resamples
+//   of the fit pool):
+//
+//   1. Ridge (lambda 5) on the slope and quadratic coefficients. With only ~40
+//      comparables the OLS quadratic is jittery at the top end; the ridge shrinks it
+//      slightly toward the linear fit and stabilises extrapolation past the biggest
+//      observed hour-1 (875k) — exactly where GTA VI will land.
+//   2. Pooled residual quantiles. With ~37 residuals per hour, the 5%/95% empirical
+//      quantiles are the 2nd order statistic — pure noise. The residuals are now
+//      normalised per hour by their MAD scale, pooled across all 23 hours (~850
+//      points), and the pooled quantiles are rescaled per hour. Same centre, much
+//      steadier tails.
+//   3. Scale-conditioned spread. Big launches are far more predictable than small
+//      ones: the median |residual| is 0.79 for hour-1 under 10k, 0.34 at 10k-200k
+//      and 0.15 above 200k (a log|residual| ~ log(h1) slope of -0.18 measured on the
+//      comparables). So the spread is multiplied by s = max(0.45,
+//      exp(-0.18 * max(0, ln(v_1) - ln(20000)))): full width for small launches,
+//      ~half width for a million-viewer launch. The same factor applies to the
+//      thin-hour MAD fallback.
 //
 //   Fallbacks keep the entry valid on thin data: an hour with fewer than 8 usable
 //   comparables falls back to the cross-launch median log-ratio for that hour with a
-//   MAD spread; if the case holds fewer than 5 usable comparables at all, the entry
-//   falls back to the house baseline's persistence forecast (spread 0.15 log units per
-//   square-root hour).
+//   MAD spread (also scale-conditioned); if the case holds fewer than 5 usable
+//   comparables at all, the entry falls back to the house baseline's persistence
+//   forecast (spread 0.15 log units per square-root hour).
 //
 // Nothing is hard-coded from any one launch: the numbers are re-fitted from whatever
 // comparables the case carries (38 in a practice case, 42 in the final, which adds the
@@ -47,6 +61,12 @@ const Z = [-1.645, -0.674, 0, 0.674, 1.645];
 const FALLBACK_SIGMA = 0.15;
 /** Centre for ln(viewers_1): keeps the quadratic fit well conditioned. */
 const LOG_CENTRE = 10;
+/** Ridge penalty on the slope and quadratic coefficients (not the intercept). */
+const RIDGE = 5;
+/** Spread conditioning: residual scale falls with launch size, slope measured on the comparables. */
+const SPREAD_REF = 20000;
+const SPREAD_SLOPE = 0.18;
+const SPREAD_FLOOR = 0.45;
 /** A per-hour regression needs at least this many comparables; below it, use the median. */
 const MIN_PER_HOUR = 8;
 /** Below this many usable comparables overall, fall back to persistence entirely. */
@@ -115,7 +135,8 @@ const solve3 = (m: number[][], v: number[]): number[] | null => {
   return [b[0] / a[0][0], b[1] / a[1][1], b[2] / a[2][2]];
 };
 
-/** Ordinary least squares of y on [1, x, x^2]; null when the system is singular. */
+/** Ordinary least squares of y on [1, x, x^2] with a ridge penalty on the slope
+ *  and quadratic coefficients; null when the system is singular. */
 const olsQuadratic = (xs: number[], ys: number[]): number[] | null => {
   const s = [0, 0, 0, 0, 0];
   const t = [0, 0, 0];
@@ -128,12 +149,16 @@ const olsQuadratic = (xs: number[], ys: number[]): number[] | null => {
   return solve3(
     [
       [s[0], s[1], s[2]],
-      [s[1], s[2], s[3]],
-      [s[2], s[3], s[4]],
+      [s[1], s[2] + RIDGE, s[3]],
+      [s[2], s[3], s[4] + RIDGE],
     ],
     t,
   );
 };
+
+/** The spread scale for a launch of hour-1 size p1: big launches are steadier. */
+const spreadScale = (p1: number): number =>
+  Math.max(SPREAD_FLOOR, Math.exp(-SPREAD_SLOPE * Math.max(0, Math.log(p1) - Math.log(SPREAD_REF))));
 
 /** 3-point moving average over hours 2..24 (endpoints average their two neighbours). */
 const smoothHours = (vals: Map<number, number>): Map<number, number> => {
@@ -194,8 +219,12 @@ const forecastCase = (c: CaseFile): Map<number, number[]> => {
   }
 
   const x0 = Math.log(p1) - LOG_CENTRE;
+  const sFactor = spreadScale(p1);
   const medians = new Map<number, number>();
   const offsets = new Map<number, number[]>();
+  // Per-hour centred residuals and their MAD scale, for the pooled spread.
+  const centredByHour = new Map<number, number[]>();
+  const scaleByHour = new Map<number, number>();
   for (let h = 2; h <= 24; h++) {
     const xs: number[] = [];
     const ys: number[] = [];
@@ -212,8 +241,11 @@ const forecastCase = (c: CaseFile): Map<number, number[]> => {
         const resid = ys.map((y, i) => y - (beta[0] + beta[1] * xs[i] + beta[2] * xs[i] * xs[i]));
         const shift = median(resid);
         medians.set(h, beta[0] + beta[1] * x0 + beta[2] * x0 * x0 + shift);
-        const centred = resid.map((r) => r - shift).sort((a, b) => a - b);
-        offsets.set(h, levels.map((tau) => quantileOfSorted(centred, tau)));
+        const centred = resid.map((r) => r - shift);
+        centredByHour.set(h, centred);
+        const mid = median(centred);
+        const mad = median(centred.map((r) => Math.abs(r - mid)));
+        scaleByHour.set(h, Math.max(0.05, 1.4826 * mad));
         continue;
       }
     }
@@ -223,7 +255,24 @@ const forecastCase = (c: CaseFile): Map<number, number[]> => {
     const mad = median(ratios.map((r) => Math.abs(r - mu)));
     const sig = Math.max(0.1, 1.4826 * mad);
     medians.set(h, mu);
-    offsets.set(h, levels.map((_tau, j) => (Z[j] ?? 0) * sig));
+    offsets.set(h, levels.map((_tau, j) => (Z[j] ?? 0) * sig * sFactor));
+  }
+
+  // Pooled spread: normalise each regression hour's residuals by its MAD scale,
+  // pool them across hours (~850 points), take the pooled quantiles, and rescale
+  // per hour. Steadier tails than per-hour empirical quantiles from ~37 points.
+  const pooled: number[] = [];
+  for (const [h, centred] of centredByHour) {
+    const sc = scaleByHour.get(h) as number;
+    for (const r of centred) pooled.push(r / sc);
+  }
+  pooled.sort((a, b) => a - b);
+  for (const [h] of centredByHour) {
+    const sc = scaleByHour.get(h) as number;
+    offsets.set(
+      h,
+      levels.map((tau) => quantileOfSorted(pooled, tau) * sc * sFactor),
+    );
   }
 
   const smoothMed = smoothHours(medians);
